@@ -1,0 +1,123 @@
+# TEMPORARY workflow: set up 3 new domains in Cloudflare (zones, Email Routing DNS, catch-all to worker)
+# and redeploy the temp-email worker with DOMAINS/DEFAULT_DOMAINS = the 5 domains.
+# Delete this file after the setup is done.
+name: CF Domains Setup (temp)
+on:
+  workflow_dispatch:
+jobs:
+  setup-zones:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: Setup zones, DNS and Email Routing
+        run: |
+          set -uo pipefail
+          API="https://api.cloudflare.com/client/v4"
+          AUTH=(-H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H "Content-Type: application/json")
+          echo "== token verify =="
+          curl -s "${AUTH[@]}" "$API/user/tokens/verify" | jq -c '{success, status: .result.status}'
+          add_record() {
+            local zid="$1" type="$2" name="$3" content="$4" prio="${5:-}" ttl="${6:-3600}"
+            local existing
+            existing=$(curl -s -G "${AUTH[@]}" "$API/zones/$zid/dns_records" --data-urlencode "type=$type" --data-urlencode "name=$name" --data-urlencode "content=$content" | jq -r '.result | length')
+            if [ "$existing" != "0" ]; then echo "exists: $type $name $content"; return 0; fi
+            local body out ok
+            body=$(jq -n --arg t "$type" --arg n "$name" --arg c "$content" --argjson ttl "$ttl" '{type:$t,name:$n,content:$c,ttl:$ttl}')
+            if [ -n "$prio" ]; then body=$(echo "$body" | jq --argjson p "$prio" '.+{priority:$p}'); fi
+            out=$(curl -s "${AUTH[@]}" -X POST "$API/zones/$zid/dns_records" -d "$body")
+            ok=$(echo "$out" | jq -r '.success')
+            if [ "$ok" != "true" ]; then
+              if echo "$out" | grep -q '"code":81057'; then echo "already exists(api): $type $name"; return 0; fi
+              echo "$out" | jq -c '{success, errors}'; return 1
+            fi
+            echo "$out" | jq -c '{success, errors}'
+          }
+          setup_domain() {
+            local domain="$1" resp zid
+            echo "##### $domain #####"
+            resp=$(curl -s "${AUTH[@]}" "$API/zones?name=$domain")
+            zid=$(echo "$resp" | jq -r '.result[0].id // empty')
+            if [ -z "$zid" ]; then
+              echo "creating zone $domain"
+              resp=$(curl -s "${AUTH[@]}" -X POST "$API/zones" -d "{\"name\":\"$domain\",\"account\":{\"id\":\"$CLOUDFLARE_ACCOUNT_ID\"},\"type\":\"full\"}")
+              echo "$resp" | jq -c .
+              zid=$(echo "$resp" | jq -r '.result.id // empty')
+            fi
+            if [ -z "$zid" ]; then echo "ERROR: no zone id for $domain"; return 1; fi
+            echo "ZONE_ID[$domain]=$zid"
+            curl -s "${AUTH[@]}" "$API/zones/$zid" | jq -r '.result.name_servers | join(", ")' | sed "s/^/NS[$domain]= /"
+            echo "-- enable email routing --"
+            curl -s "${AUTH[@]}" -X POST "$API/zones/$zid/email/routing/enable" | jq -c '{success, errors, result}' || true
+            echo "-- required dns records --"
+            local recs
+            recs=$(curl -s "${AUTH[@]}" "$API/zones/$zid/email/routing/dns")
+            echo "$recs" | jq -c .
+            while read -r r; do
+              local t n c p ttl
+              t=$(echo "$r" | jq -r '.type'); n=$(echo "$r" | jq -r '.name'); c=$(echo "$r" | jq -r '.content')
+              p=$(echo "$r" | jq -r '.priority // empty'); ttl=$(echo "$r" | jq -r '.ttl // 3600')
+              add_record "$zid" "$t" "$n" "$c" "$p" "$ttl" || true
+            done < <(echo "$recs" | jq -c '(.result | if type == "array" then .[] elif (.records // null) != null then .records[] else empty end)')
+            echo "-- catch-all to worker --"
+            curl -s "${AUTH[@]}" -X PUT "$API/zones/$zid/email/routing/rules/catch_all" -d '{"actions":[{"type":"worker","value":["cloudflare-temp-email"]}],"enabled":true,"matchers":[{"type":"all"}],"name":"catch-all"}' | jq -c '{success, errors, result}'
+            echo "-- verify catch-all --"
+            curl -s "${AUTH[@]}" "$API/zones/$zid/email/routing/rules/catch_all" | jq -c '{success, result}'
+          }
+          for d in ljl19891110.ccwu.cc han1822.ccwu.cc warmasjade.ccwu.cc; do
+            setup_domain "$d" || true
+          done
+          echo "##### existing zones (read only) #####"
+          for d in jinglinaini.ccwu.cc lxd19891110.ccwu.cc; do
+            zid=$(curl -s "${AUTH[@]}" "$API/zones?name=$d" | jq -r '.result[0].id // empty')
+            echo "ZONE_ID[$d]=$zid"
+            curl -s "${AUTH[@]}" "$API/zones/$zid/email/routing/rules/catch_all" | jq -c '{success, result}'
+          done
+  deploy-worker:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      WRANGLER_TOML_CONTENT: ${{ secrets.BACKEND_TOML }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 10
+          run_install: false
+      - name: Update DOMAINS to 5 domains and deploy worker
+        run: |
+          set -euo pipefail
+          cd worker/
+          printf '%s\n' "$WRANGLER_TOML_CONTENT" > wrangler.toml
+          python3 - <<'PY'
+          import re
+          p = 'wrangler.toml'
+          s = open(p).read()
+          new = '["jinglinaini.ccwu.cc", "lxd19891110.ccwu.cc", "ljl19891110.ccwu.cc", "han1822.ccwu.cc", "warmasjade.ccwu.cc"]'
+          def replace(key, text):
+              pat = re.compile(r'^' + key + r'\s*=\s*\[.*?\]', re.M | re.S)
+              return pat.subn(key + ' = ' + new, text, count=1)
+          s, n1 = replace('DOMAINS', s)
+          s, n2 = replace('DEFAULT_DOMAINS', s)
+          if n1 == 0:
+              s, n1 = re.subn(r'^(\[vars\])', r'\1\nDOMAINS = ' + new, s, count=1, flags=re.M)
+          if n2 == 0:
+              s, n2 = re.subn(r'^(\[vars\])', r'\1\nDEFAULT_DOMAINS = ' + new, s, count=1, flags=re.M)
+          open(p, 'w').write(s)
+          print(f'DOMAINS replaced={n1} DEFAULT_DOMAINS replaced={n2}')
+          assert n1 > 0 and n2 > 0, 'DOMAINS lines not found in wrangler.toml'
+          for line in s.splitlines():
+              if line.startswith(('DOMAINS', 'DEFAULT_DOMAINS')):
+                  print(line)
+          PY
+          pnpm install
+          pnpm run deploy || { cd ..; pnpm --filter worker run deploy; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: updated-wrangler-toml
+          path: worker/wrangler.toml
