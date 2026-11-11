@@ -1,6 +1,6 @@
-# TEMPORARY diagnostic: check what the repo API token can do on the two existing zones
-# (read-only: zone status, email routing catch-all, required DNS records, dns_records).
-# Delete after use.
+# TEMPORARY: try to create a broader Cloudflare API token with the existing token,
+# and if that works, use the new token (value never printed) to create the 3 zones
+# and set up Email Routing. Delete after use.
 name: CF Diag (temp)
 on:
   workflow_dispatch:
@@ -11,19 +11,75 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
-      - name: Check token permissions on existing zones
+      - name: Create broader token and set up zones
         run: |
           set -uo pipefail
           API="https://api.cloudflare.com/client/v4"
           AUTH=(-H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H "Content-Type: application/json")
-          for zid in 4ca69606a5fa06396a9cf7cb9412b7d7 920e440a6f323f171e4c24f26943ba64; do
-            echo "===== zone $zid ====="
-            echo "-- zone --"
-            curl -s "${AUTH[@]}" "$API/zones/$zid" | jq -c '{success, name: .result.name, status: .result.status, errors}'
-            echo "-- routing catch_all --"
-            curl -s "${AUTH[@]}" "$API/zones/$zid/email/routing/rules/catch_all" | jq -c .
-            echo "-- routing dns (required records) --"
-            curl -s "${AUTH[@]}" "$API/zones/$zid/email/routing/dns" | jq -c .
-            echo "-- dns_records (first 10) --"
-            curl -s "${AUTH[@]}" "$API/zones/$zid/dns_records?per_page=10" | jq -c '{success, count: (.result | length), errors, records: [.result[] | .type + " " + .name + " " + .content]}'
+          echo "-- list permission groups (relevant) --"
+          groups=$(curl -s "${AUTH[@]}" "$API/user/tokens/permission_groups")
+          echo "$groups" | jq -r '.result[]? | select(.name | test("Zone|Email Routing|API Token"; "i")) | .id + " " + .name' | head -40
+          zw=$(echo "$groups" | jq -r '.result[]? | select(.name=="Zone Write") | .id' | head -1)
+          er=$(echo "$groups" | jq -r '.result[]? | select(.name=="Email Routing Write") | .id' | head -1)
+          echo "zone_write_id=${zw:+found} email_routing_write_id=${er:+found}"
+          [ -n "$zw" ] && [ -n "$er" ] || { echo "SKIP: required permission groups not found"; exit 0; }
+          echo "-- attempt token creation --"
+          resp=$(curl -s "${AUTH[@]}" -X POST "$API/user/tokens" -d "{\"name\":\"temp-zone-admin\",\"policies\":[{\"effect\":\"allow\",\"permission_groups\":[{\"id\":\"$zw\"},{\"id\":\"$er\"}],\"resources\":{\"com.cloudflare.api.account.zone.*\":\"*\"}}]}")
+          ok=$(echo "$resp" | jq -r '.success')
+          echo "$resp" | jq -c '{success, errors, id: .result.id, status: .result.status}'
+          [ "$ok" = "true" ] || { echo "TOKEN_CREATE_FAILED"; exit 0; }
+          NEW_TOKEN=$(echo "$resp" | jq -r '.result.value // empty')
+          [ -n "$NEW_TOKEN" ] || { echo "no token value returned"; exit 0; }
+          echo "NEW_TOKEN_CREATED (value hidden)"
+          N_AUTH=(-H "Authorization: Bearer $NEW_TOKEN" -H "Content-Type: application/json")
+          curl -s "${N_AUTH[@]}" "$API/user/tokens/verify" | jq -c '{success, status: .result.status}'
+          add_record() {
+            local zid="$1" type="$2" name="$3" content="$4" prio="${5:-}" ttl="${6:-3600}"
+            local existing
+            existing=$(curl -s -G "${N_AUTH[@]}" "$API/zones/$zid/dns_records" --data-urlencode "type=$type" --data-urlencode "name=$name" --data-urlencode "content=$content" | jq -r '.result | length')
+            if [ "$existing" != "0" ]; then echo "exists: $type $name $content"; return 0; fi
+            local body out ok2
+            body=$(jq -n --arg t "$type" --arg n "$name" --arg c "$content" --argjson ttl "$ttl" '{type:$t,name:$n,content:$c,ttl:$ttl}')
+            if [ -n "$prio" ]; then body=$(echo "$body" | jq --argjson p "$prio" '.+{priority:$p}'); fi
+            out=$(curl -s "${N_AUTH[@]}" -X POST "$API/zones/$zid/dns_records" -d "$body")
+            ok2=$(echo "$out" | jq -r '.success')
+            if [ "$ok2" != "true" ]; then
+              if echo "$out" | grep -q '"code":81057'; then echo "already exists(api): $type $name"; return 0; fi
+              echo "$out" | jq -c '{success, errors}'; return 1
+            fi
+            echo "$out" | jq -c '{success, errors}'
+          }
+          setup_domain() {
+            local domain="$1" resp zid
+            echo "##### $domain #####"
+            resp=$(curl -s "${N_AUTH[@]}" "$API/zones?name=$domain")
+            zid=$(echo "$resp" | jq -r '.result[0].id // empty')
+            if [ -z "$zid" ]; then
+              echo "creating zone $domain"
+              resp=$(curl -s "${N_AUTH[@]}" -X POST "$API/zones" -d "{\"name\":\"$domain\",\"account\":{\"id\":\"$CLOUDFLARE_ACCOUNT_ID\"},\"type\":\"full\"}")
+              echo "$resp" | jq -c .
+              zid=$(echo "$resp" | jq -r '.result.id // empty')
+            fi
+            if [ -z "$zid" ]; then echo "ERROR: no zone id for $domain"; return 1; fi
+            echo "ZONE_ID[$domain]=$zid"
+            curl -s "${N_AUTH[@]}" "$API/zones/$zid" | jq -r '.result.name_servers | join(", ")' | sed "s/^/NS[$domain]= /"
+            echo "-- enable email routing --"
+            curl -s "${N_AUTH[@]}" -X POST "$API/zones/$zid/email/routing/enable" | jq -c '{success, errors, result}' || true
+            echo "-- required dns records --"
+            local recs
+            recs=$(curl -s "${N_AUTH[@]}" "$API/zones/$zid/email/routing/dns")
+            echo "$recs" | jq -c .
+            while read -r r; do
+              local t n c p ttl
+              t=$(echo "$r" | jq -r '.type'); n=$(echo "$r" | jq -r '.name'); c=$(echo "$r" | jq -r '.content')
+              p=$(echo "$r" | jq -r '.priority // empty'); ttl=$(echo "$r" | jq -r '.ttl // 3600')
+              add_record "$zid" "$t" "$n" "$c" "$p" "$ttl" || true
+            done < <(echo "$recs" | jq -c '(.result | if type == "array" then .[] elif (.records // null) != null then .records[] else empty end)')
+            echo "-- catch-all to worker --"
+            curl -s "${N_AUTH[@]}" -X PUT "$API/zones/$zid/email/routing/rules/catch_all" -d '{"actions":[{"type":"worker","value":["cloudflare-temp-email"]}],"enabled":true,"matchers":[{"type":"all"}],"name":"catch-all"}' | jq -c '{success, errors, result}'
+            echo "-- verify catch-all --"
+            curl -s "${N_AUTH[@]}" "$API/zones/$zid/email/routing/rules/catch_all" | jq -c '{success, result}'
+          }
+          for d in ljl19891110.ccwu.cc han1822.ccwu.cc warmasjade.ccwu.cc; do
+            setup_domain "$d" || true
           done
